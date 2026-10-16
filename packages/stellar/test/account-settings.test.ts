@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Account, Keypair, Networks } from "@stellar/stellar-sdk";
+import { Account, Keypair, Networks, Operation } from "@stellar/stellar-sdk";
 import { StellarTransactionBuilder } from "../src/transaction-builder.js";
 import type { AccountSettingsIntent } from "@4evergent/shared";
 
@@ -18,6 +18,14 @@ function getSetOptionsOp(tx: any) {
   assert.equal(op.type, "setOptions");
   return op;
 }
+
+// ── buildSetOptions primitive ────────────────────────────────
+test("SET OPTIONS: builds a single setOptions op", async () => {
+  const acct = fakeAccount("100");
+  const tx = await builder.buildSetOptions(acct, { homeDomain: "example.com" }, NETWORK);
+  const op = getSetOptionsOp(tx);
+  assert.equal(op.homeDomain, "example.com");
+});
 
 // ── home_domain ──────────────────────────────────────────────
 test("ACCOUNT SETTINGS: builds home_domain op", async () => {
@@ -128,4 +136,9 @@ test("ACCOUNT SETTINGS: throws on missing thresholds field", async () => {
   const acct = fakeAccount("100");
   const intent: AccountSettingsIntent = { type: "account_settings", setting: "thresholds", value: { low: 1, medium: 2 }, reason: "test" };
   await assert.rejects(() => builder.buildAccountSettings(acct, intent, NETWORK), /thresholds\..* must be a number/);
+});
+
+test("SET OPTIONS: empty options throws", async () => {
+  const acct = fakeAccount("100");
+  await assert.rejects(() => builder.buildSetOptions(acct, {}, NETWORK), /at least one option/);
 });
