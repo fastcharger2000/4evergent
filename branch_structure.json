@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-55-add-an-operation-setoptions-capability-to-the",
+    "fix/issue-55-add-an-operation-setoptions-capability-to-the-r2",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-55-add-an-operation-setoptions-capability-to-the": "main",
+    "fix/issue-55-add-an-operation-setoptions-capability-to-the-r2": "fix/issue-55-add-an-operation-setoptions-capability-to-the",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-55-add-an-operation-setoptions-capability-to-the",
+    "origin",
+    "fix/issue-55-add-an-operation-setoptions-capability-to-the-r2"
+  ]
+}
