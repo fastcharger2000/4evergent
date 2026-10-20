@@ -306,228 +306,83 @@ export class TransactionPipeline {
     // the intent must be denied.
     // skipReservation: daily spending was already reserved at intent-creation time.
     // Re-evaluating here must NOT double-reserve.
-    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true });
+    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId);
     if (currentDecision.result === "deny") {
-      await this.approvalStore.update(approvalId, { status: "failed", error: `Policy re-evaluation denied: ${currentDecision.reason}` });
+      await this.approvalStore.update(approvalId, { status: "expired" });
       return {
         status: "rejected",
-        message: `Policy re-evaluation denied: ${currentDecision.reason}`,
+        message: `Policy denied at execution time: ${currentDecision.reason}`,
         policyDecision: currentDecision,
         simulationResult: null,
         activityId: approval.activityId,
       };
     }
 
-    await this.approvalStore.update(approvalId, { status: "executing" });
+    // Mark approval as being executed before submitting to prevent concurrent execution.
+    await this.approvalStore.update(approvalId, {
+      status: "approved",
+      approver: approver ?? approval.approverId,
+    });
 
-    const intent = approval.intent;
-    const adapter = new StellarAdapter(this.horizonUrl);
+    const outcome = await this.execute({
+      intent: approval.intent,
+      sourceAccount: (approval as any).sourceAccount,
+      activityId: approval.activityId,
+    });
 
-    let sourceAccount: any;
-    try {
-      const account = await adapter.getAccount(this.signer.getAccountId());
-      sourceAccount = {
-        accountId: () => account.address,
-        sequenceNumber: () => account.sequence,
-        incrementSequenceNumber: () => {},
-        agentId: approval.agentId,
-      };
-    } catch (e: any) {
-      await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
-      return {
-        status: "rejected",
-        message: `Cannot load source account: ${e.message}`,
-        policyDecision: { result: "deny", reason: "account load failed", rule: "approval", intent },
-        simulationResult: null,
-        activityId: approval.activityId,
-      };
-    }
+    await this.approvalStore.update(approvalId, {
+      status: outcome.status === "submitted" ? "submitted" : "failed",
+      txHash: outcome.txHash,
+    });
 
-    let tx;
-    try {
-      if (intent.type === "account_settings") {
-        tx = await this.builder.buildAccountSettings(sourceAccount, intent as AccountSettingsIntent, this.signer.getNetworkPassphrase());
-      } else {
-        tx = await this.builder.buildPayment(sourceAccount, intent as any, this.signer.getNetworkPassphrase());
-      }
-    } catch (e: any) {
-      await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
-      return {
-        status: "rejected",
-        message: `Construction failed: ${e.message}`,
-        policyDecision: { result: "deny", reason: "construction", rule: "approval", intent },
-        simulationResult: null,
-        activityId: approval.activityId,
-      };
-    }
-
-    const simResult = await this.simulator.simulate(tx);
-    if (!simResult.success) {
-      await this.approvalStore.update(approvalId, { status: "failed", error: simResult.error ?? "Simulation failed" });
-      return {
-        status: "simulation_failed",
-        message: simResult.error ?? "Simulation failed",
-        policyDecision: { result: "deny", reason: "simulation", rule: "approval", intent },
-        simulationResult: simResult,
-        activityId: approval.activityId,
-      };
-    }
-
-    let signedTx;
-    try {
-      signedTx = await this.signer.sign(tx);
-    } catch (e: any) {
-      await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
-      return {
-        status: "rejected",
-        message: `Signing failed: ${e.message}`,
-        policyDecision: { result: "deny", reason: "signing", rule: "approval", intent },
-        simulationResult: simResult,
-        activityId: approval.activityId,
-      };
-    }
-
-    // PERSIST txHash BEFORE submit to survive crash window
-    const preSubmitHash = signedTx.hash().toString("hex");
-
-    try {
-      const result = await this.submitter.submit(signedTx, this.signer.getNetworkPassphrase());
-      await this.approvalStore.update(approvalId, { status: "submitted", txHash: result.hash, approvedAt: new Date().toISOString(), approver: approver ?? null });
-      if (approval.activityId) {
-        const existing = await this.activityStore.get(approval.activityId);
-        if (existing) {
-          await this.activityStore.update(approval.activityId, { status: "submitted", txHash: result.hash, simulationResult: simResult, authorizationStatus: "approved" });
-        }
-      }
-      return {
-        status: "submitted",
-        message: `Transaction submitted: ${result.hash}`,
-        policyDecision: currentDecision,
-        simulationResult: simResult,
-        txHash: result.hash,
-        activityId: approval.activityId,
-      };
-    } catch (e: any) {
-      await this.approvalStore.update(approvalId, { status: "failed", error: e.message });
-      return {
-        status: "rejected",
-        message: `Submission failed: ${e.message}`,
-        policyDecision: { result: "deny", reason: "submission", rule: "approval", intent },
-        simulationResult: simResult,
-        txHash: preSubmitHash,
-        activityId: approval.activityId,
-      };
-    }
+    return outcome;
   }
 
-  private async persistActivity(
-    record: ActivityRecord,
-    idempotencyKey?: string | null,
-    existingActivityId?: string
-  ): Promise<void> {
-    if (!this.activityStore) return;
-
-    // Schedule-driven path: update the pre-existing activity record
-    // created by the scheduler callback instead of creating a duplicate.
-    if (existingActivityId) {
-      await this.activityStore.update(existingActivityId, {
-        status: record.status,
-        authorizationStatus: record.authorizationStatus,
-        error: record.error,
-        txHash: record.txHash,
-        simulationResult: record.simulationResult,
-      });
-      return;
-    }
-
-    if (idempotencyKey) {
-      const result = await this.activityStore.recordIdempotent(idempotencyKey, record);
-      if (!result.created) {
-        // Another request already reserved this key — merge the new state into existing
-        await this.activityStore.update(result.record.id, {
-          status: record.status,
-          authorizationStatus: record.authorizationStatus,
-          error: record.error,
-          txHash: record.txHash,
-          simulationResult: record.simulationResult,
-        });
-      }
-    } else {
-      await this.activityStore.record(record);
-    }
-  }
-
-  /**
-   * Returns the ActivityRecord to use for persistence.
-   *
-   * When the scheduler pre-creates an ActivityRecord (activityId provided),
-   * we update that existing record instead of creating a new one — this
-   * prevents duplicate activity records for schedule-driven executions.
-   *
-   * For manual intent execution (no activityId), we create a new record as before.
-   */
   private resolveActivity(
-    activityId: string | undefined,
+    existingId: string | undefined,
     agentId: string,
     ownerId: string,
     intent: AgentIntent,
     decision: PolicyDecision,
-    idempotencyKey?: string | null
+    idempotencyKey?: string | null,
   ): ActivityRecord {
-    if (activityId && this.activityStore) {
-      // Return a skeleton record carrying the existing id so callers can
-      // set status/error/txHash fields that persistActivity will write.
-      // We still call createActivity to get a well-formed skeleton, then
-      // override the id to point at the pre-existing record.
-      const skeleton = createActivity(agentId, ownerId, intent, decision, idempotencyKey);
-      skeleton.id = activityId;
-      return skeleton;
+    if (existingId) {
+      return {
+        id: existingId,
+        agentId,
+        ownerId,
+        intent,
+        policyDecision: decision,
+        status: "pending",
+        authorizationStatus: "pending",
+        createdAt: new Date().toISOString(),
+        idempotencyKey: idempotencyKey ?? null,
+      } as ActivityRecord;
     }
-    return createActivity(agentId, ownerId, intent, decision, idempotencyKey);
+    return createActivity(agentId, ownerId, intent, decision, idempotencyKey ?? null);
+  }
+
+  private async persistActivity(
+    activity: ActivityRecord,
+    idempotencyKey: string | null | undefined,
+    existingId: string | undefined,
+  ): Promise<void> {
+    if (!this.activityStore) return;
+    if (existingId) {
+      await this.activityStore.update(existingId, activity);
+    } else {
+      await this.activityStore.record(activity);
+    }
   }
 }
 
-export type PipelineOutcome =
-  | {
-  status: "submitted";
+export interface PipelineOutcome {
+  status: "submitted" | "rejected" | "simulation_failed" | "requires_approval";
   message: string;
   policyDecision: PolicyDecision;
-  simulationResult: SimulationLike;
-  txHash: string;
+  simulationResult: any;
+  txHash?: string;
   activityId?: string;
   approvalId?: string;
   submittedHash?: string;
-  }
-  | {
-      status: "simulation_failed";
-      message: string;
-      policyDecision: PolicyDecision;
-      simulationResult: SimulationLike;
-      txHash?: string | null;
-      activityId?: string;
-    }
-  | {
-      status: "requires_approval";
-      message: string;
-      policyDecision: PolicyDecision;
-      simulationResult?: SimulationLike | null;
-      txHash?: string | null;
-      activityId?: string;
-      approvalId?: string;
-    }
-  | {
-      status: "rejected";
-      message: string;
-      policyDecision: PolicyDecision;
-      simulationResult: SimulationLike | null;
-      txHash?: string | null;
-      activityId?: string;
-    };
-
-interface SimulationLike {
-  success: boolean;
-  fee: string;
-  operations: number;
-  warnings: string[];
-  error?: string;
 }
