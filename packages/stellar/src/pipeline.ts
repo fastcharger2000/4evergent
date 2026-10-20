@@ -2,9 +2,9 @@ import { StellarTransactionBuilder } from "./transaction-builder.js";
 import { StellarSimulator } from "./simulator.js";
 import { StellarSubmitter } from "./submitter.js";
 import type { Signer } from "./signer.js";
-import { PolicyEngine } from "@4evergent/policy";
-import { IntentValidator } from "@4evergent/agent-core";
-import { StellarAdapter } from "@4evergent/agent-core";
+import { PolicyEngine } from "@44evergent/policy";
+import { IntentValidator } from "@44evergent/agent-core";
+import { StellarAdapter } from "@44evergent/agent-core";
 import type { AgentIntent, AccountSettingsIntent, PolicyDecision, PolicyRules, ActivityRecord } from "@4evergent/shared";
 import {
   createActivity,
@@ -306,9 +306,9 @@ export class TransactionPipeline {
     // the intent must be denied.
     // skipReservation: daily spending was already reserved at intent-creation time.
     // Re-evaluating here must NOT double-reserve.
-    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId);
-    if (currentDecision.result === "deny") {
-      await this.approvalStore.update(approvalId, { status: "expired" });
+    const currentDecision = await this.policy.evaluate(approval.intent, approval.agentId, { skipReservation: true });
+    if (currentDecision.result !== "allow") {
+      await this.approvalStore.update(approvalId, { status: "denied", deniedAt: new Date().toISOString(), reason: currentDecision.reason });
       return {
         status: "rejected",
         message: `Policy denied at execution time: ${currentDecision.reason}`,
@@ -318,22 +318,32 @@ export class TransactionPipeline {
       };
     }
 
-    // Mark approval as being executed before submitting to prevent concurrent execution.
+    // Mark approval as executing before running the pipeline to prevent double-execution.
     await this.approvalStore.update(approvalId, {
       status: "approved",
-      approver: approver ?? approval.approverId,
+      approvedAt: new Date().toISOString(),
+      approvedBy: approver,
     });
 
+    // Run the pipeline with the approved intent.
     const outcome = await this.execute({
       intent: approval.intent,
-      sourceAccount: (approval as any).sourceAccount,
+      sourceAccount: approval.sourceAccount,
       activityId: approval.activityId,
     });
 
-    await this.approvalStore.update(approvalId, {
-      status: outcome.status === "submitted" ? "submitted" : "failed",
-      txHash: outcome.txHash,
-    });
+    if (outcome.status === "submitted") {
+      await this.approvalStore.update(approvalId, {
+        status: "submitted",
+        txHash: outcome.txHash,
+        submittedAt: new Date().toISOString(),
+      });
+    } else {
+      await this.approvalStore.update(approvalId, {
+        status: "failed",
+        reason: outcome.message,
+      });
+    }
 
     return outcome;
   }
@@ -344,7 +354,7 @@ export class TransactionPipeline {
     ownerId: string,
     intent: AgentIntent,
     decision: PolicyDecision,
-    idempotencyKey?: string | null,
+    idempotencyKey: string | null | undefined
   ): ActivityRecord {
     if (existingId) {
       return {
@@ -352,9 +362,9 @@ export class TransactionPipeline {
         agentId,
         ownerId,
         intent,
-        policyDecision: decision,
         status: "pending",
         authorizationStatus: "pending",
+        policyDecision: decision,
         createdAt: new Date().toISOString(),
         idempotencyKey: idempotencyKey ?? null,
       } as ActivityRecord;
@@ -365,7 +375,7 @@ export class TransactionPipeline {
   private async persistActivity(
     activity: ActivityRecord,
     idempotencyKey: string | null | undefined,
-    existingId: string | undefined,
+    existingId: string | undefined
   ): Promise<void> {
     if (!this.activityStore) return;
     if (existingId) {
@@ -380,7 +390,7 @@ export interface PipelineOutcome {
   status: "submitted" | "rejected" | "simulation_failed" | "requires_approval";
   message: string;
   policyDecision: PolicyDecision;
-  simulationResult: any;
+  simulationResult: any | null;
   txHash?: string;
   activityId?: string;
   approvalId?: string;
