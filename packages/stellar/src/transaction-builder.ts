@@ -13,6 +13,25 @@ export interface AssetIdentifier {
   issuer: string | null;
 }
 
+export interface SetOptionsSigner {
+  /** Ed25519 public key (G...) or signer key string. */
+  key: string;
+  /** Weight 0-255. 0 removes the signer. */
+  weight: number;
+}
+
+export interface SetOptionsParams {
+  inflationDest?: string;
+  clearFlags?: number;
+  setFlags?: number;
+  masterWeight?: number;
+  lowThreshold?: number;
+  medThreshold?: number;
+  highThreshold?: number;
+  homeDomain?: string;
+  signer?: SetOptionsSigner | null;
+}
+
 function parseAssetInput(input: { asset?: string; assetDetails?: { code: string; issuer: string | null } }): AssetIdentifier {
   if (input.assetDetails) {
     return { code: input.assetDetails.code, issuer: input.assetDetails.issuer };
@@ -24,6 +43,19 @@ function parseAssetInput(input: { asset?: string; assetDetails?: { code: string;
 function toStellarAsset(id: AssetIdentifier): Asset {
   if (id.code === "XLM" || !id.issuer) return Asset.native();
   return new Asset(id.code, id.issuer);
+}
+
+function isValidAddress(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith("G") && value.length === 56;
+}
+
+function isWeight(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 255;
+}
+
+function truncateToMemo(reason?: string): string {
+  const text = reason ?? "";
+  return text.length > 28 ? text.slice(0, 28) : text;
 }
 
 export class StellarTransactionBuilder {
@@ -106,6 +138,124 @@ export class StellarTransactionBuilder {
     return builder.build();
   }
 
+  /**
+   * Lower-level primitive for Stellar's `setOptions` operation.
+   *
+   * All fields in `SetOptionsParams` are optional; omitting a field leaves the
+   * existing account setting unchanged. An empty options object is rejected
+   * because the Stellar protocol requires at least one setOptions field.
+   */
+  async buildSetOptions(
+    sourceAccount: Account,
+    options: SetOptionsParams,
+    networkPassphrase: string
+  ): Promise<Transaction> {
+    const op = this.resolveSetOptionsOperation(options);
+
+    const builder = new TransactionBuilder(sourceAccount, {
+      networkPassphrase,
+      fee: "100000",
+    });
+    builder.addOperation(op);
+    builder.setTimeout(30);
+
+    return builder.build();
+  }
+
+  private resolveSetOptionsOperation(options: SetOptionsParams) {
+    if (!options || typeof options !== "object") {
+      throw new Error("StellarTransactionBuilder: setOptions options object required");
+    }
+
+    const resolved: Record<string, unknown> = {};
+    let fieldCount = 0;
+
+    if (options.inflationDest !== undefined) {
+      if (!isValidAddress(options.inflationDest)) {
+        throw new Error("StellarTransactionBuilder: inflationDest must be a valid Stellar address (G...)");
+      }
+      resolved.inflationDest = options.inflationDest;
+      fieldCount++;
+    }
+
+    if (options.setFlags !== undefined) {
+      if (!isWeight(options.setFlags)) {
+        throw new Error("StellarTransactionBuilder: setFlags must be an integer between 0 and 255");
+      }
+      resolved.setFlags = options.setFlags;
+      fieldCount++;
+    }
+
+    if (options.clearFlags !== undefined) {
+      if (!isWeight(options.clearFlags)) {
+        throw new Error("StellarTransactionBuilder: clearFlags must be an integer between 0 and 255");
+      }
+      resolved.clearFlags = options.clearFlags;
+      fieldCount++;
+    }
+
+    if (options.masterWeight !== undefined) {
+      if (!isWeight(options.masterWeight)) {
+        throw new Error("StellarTransactionBuilder: masterWeight must be an integer between 0 and 255");
+      }
+      resolved.masterWeight = options.masterWeight;
+      fieldCount++;
+    }
+
+    if (options.lowThreshold !== undefined) {
+      if (!isWeight(options.lowThreshold)) {
+        throw new Error("StellarTransactionBuilder: lowThreshold must be an integer between 0 and 255");
+      }
+      resolved.lowThreshold = options.lowThreshold;
+      fieldCount++;
+    }
+
+    if (options.medThreshold !== undefined) {
+      if (!isWeight(options.medThreshold)) {
+        throw new Error("StellarTransactionBuilder: medThreshold must be an integer between 0 and 255");
+      }
+      resolved.medThreshold = options.medThreshold;
+      fieldCount++;
+    }
+
+    if (options.highThreshold !== undefined) {
+      if (!isWeight(options.highThreshold)) {
+        throw new Error("StellarTransactionBuilder: highThreshold must be an integer between 0 and 255");
+      }
+      resolved.highThreshold = options.highThreshold;
+      fieldCount++;
+    }
+
+    if (options.homeDomain !== undefined) {
+      if (typeof options.homeDomain !== "string" || options.homeDomain.length === 0) {
+        throw new Error("StellarTransactionBuilder: homeDomain must be a non-empty string");
+      }
+      resolved.homeDomain = options.homeDomain;
+      fieldCount++;
+    }
+
+    if (options.signer !== undefined && options.signer !== null) {
+      const signer = options.signer;
+      if (typeof signer !== "object") {
+        throw new Error("StellarTransactionBuilder: signer must be { key, weight }");
+      }
+      if (!isValidAddress(signer.key)) {
+        throw new Error("StellarTransactionBuilder: signer.key must be a valid Stellar address (G...)");
+      }
+      if (!isWeight(signer.weight)) {
+        throw new Error("StellarTransactionBuilder: signer.weight must be an integer between 0 and 255");
+      }
+      resolved.signer = { ed25519PublicKey: signer.key, weight: signer.weight };
+      fieldCount++;
+    }
+
+    if (fieldCount === 0) {
+      throw new Error("StellarTransactionBuilder: setOptions requires at least one option field");
+    }
+
+    return Operation.setOptions(resolved as any);
+  }
+
   async buildAccountSettings(
     sourceAccount: Account,
     intent: AccountSettingsIntent,
@@ -144,7 +294,7 @@ export class StellarTransactionBuilder {
         return { homeDomain: value };
       }
       case "inflation_destination": {
-        if (typeof value !== "string" || !value.startsWith("G") || value.length !== 56) {
+        if (!isValidAddress(value)) {
           throw new Error("StellarTransactionBuilder: inflation_destination must be a valid Stellar address (G...)");
         }
         return { inflationDest: value };
@@ -154,10 +304,10 @@ export class StellarTransactionBuilder {
           throw new Error("StellarTransactionBuilder: signer value must be { key, weight }");
         }
         const v = value as { key?: unknown; weight?: unknown };
-        if (typeof v.key !== "string" || !v.key.startsWith("G") || v.key.length !== 56) {
+        if (!isValidAddress(v.key)) {
           throw new Error("StellarTransactionBuilder: signer.key must be a valid Stellar address (G...)");
         }
-        if (typeof v.weight !== "number" || v.weight < 0 || v.weight > 255) {
+        if (!isWeight(v.weight)) {
           throw new Error("StellarTransactionBuilder: signer.weight must be a number between 0 and 255");
         }
         return { signer: { ed25519PublicKey: v.key, weight: v.weight } };
@@ -168,7 +318,7 @@ export class StellarTransactionBuilder {
         }
         const v = value as { low?: unknown; medium?: unknown; high?: unknown; master?: unknown };
         for (const k of ["low", "medium", "high", "master"] as const) {
-          if (typeof v[k] !== "number" || v[k] < 0 || v[k] > 255) {
+          if (!isWeight(v[k])) {
             throw new Error(`StellarTransactionBuilder: thresholds.${k} must be a number between 0 and 255`);
           }
         }
@@ -183,7 +333,7 @@ export class StellarTransactionBuilder {
         if (!Array.isArray(value)) {
           throw new Error("StellarTransactionBuilder: set_flags value must be an array of numbers");
         }
-        if (!value.every((n) => typeof n === "number" && n >= 0 && n <= 255)) {
+        if (!value.every((n) => isWeight(n))) {
           throw new Error("StellarTransactionBuilder: set_flags entries must be numbers between 0 and 255");
         }
         return { setFlags: value.reduce((a, b) => a | b, 0) };
@@ -192,22 +342,13 @@ export class StellarTransactionBuilder {
         if (!Array.isArray(value)) {
           throw new Error("StellarTransactionBuilder: clear_flags value must be an array of numbers");
         }
-        if (!value.every((n) => typeof n === "number" && n >= 0 && n <= 255)) {
+        if (!value.every((n) => isWeight(n))) {
           throw new Error("StellarTransactionBuilder: clear_flags entries must be numbers between 0 and 255");
         }
         return { clearFlags: value.reduce((a, b) => a | b, 0) };
       }
       default:
-        throw new Error(`StellarTransactionBuilder: unknown account_settings type: ${intent.setting}`);
+        throw new Error(`StellarTransactionBuilder: unsupported account setting "${setting}"`);
     }
   }
-}
-
-function truncateToMemo(text: string): string {
-  const encoder = new TextEncoder();
-  const encoded = encoder.encode(text);
-  if (encoded.length <= 28) return text;
-  let cutoff = 28;
-  while (cutoff > 0 && (encoded[cutoff]! & 0xc0) === 0x80) cutoff--;
-  return new TextDecoder("utf-8", { fatal: false }).decode(encoded.subarray(0, cutoff));
 }
